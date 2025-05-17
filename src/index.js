@@ -49,7 +49,7 @@ async function initializeJobs() {
   const jobs = await loadJobs();
 
   Object.entries(jobs).forEach(([id, job]) => {
-    startJob(id, job.url, job.schedule);
+    startJob(id, job.url, job.schedule, job.cronSecret);
   });
 }
 
@@ -57,7 +57,7 @@ async function initializeJobs() {
 const activeJobs = new Map();
 
 // Function to start a cron job
-function startJob(id, url, schedule) {
+function startJob(id, url, schedule, cronSecret) {
   // Stop existing job if any
   if (activeJobs.has(id)) {
     activeJobs.get(id).stop();
@@ -66,22 +66,46 @@ function startJob(id, url, schedule) {
   // Create and start new job
   const job = cron.schedule(schedule, async () => {
     try {
-      const response = await fetch(url);
-      console.log(`Job ${id} executed: ${response.status}`);
+      const headers = {
+        "Content-Type": "application/json",
+      };
+
+      // Add authorization header if cronSecret is provided
+      if (cronSecret) {
+        headers["Authorization"] = `Bearer ${cronSecret}`;
+      }
+
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+      });
+
+      const timestamp = new Date().toISOString();
+      console.log(`[${timestamp}] Job ${id} executed: ${response.status}`);
     } catch (error) {
-      console.error(`Error executing job ${id}:`, error.message);
+      const timestamp = new Date().toISOString();
+      console.error(`[${timestamp}] Error executing job ${id}:`, error.message);
     }
   });
 
   activeJobs.set(id, job);
 }
 
+// Middleware to check API key
+const apiKeyMiddleware = (req, res, next) => {
+  const apiKey = req.headers["x-api-key"];
+  if (!apiKey || apiKey !== process.env.API_KEY) {
+    return res.status(401).json({ error: "Unauthorized - Invalid API Key" });
+  }
+  next();
+};
+
 // Routes
 
 // Add a new cron job
-app.post("/jobs", async (req, res) => {
+app.post("/jobs", apiKeyMiddleware, async (req, res) => {
   try {
-    const { id, url, schedule } = req.body;
+    const { id, url, schedule, cronSecret } = req.body;
 
     if (!id || !url || !schedule) {
       return res.status(400).json({ error: "Missing required fields" });
@@ -92,30 +116,58 @@ app.post("/jobs", async (req, res) => {
       return res.status(400).json({ error: "Invalid cron schedule" });
     }
 
+    // Validate URL format
+    try {
+      new URL(url);
+    } catch {
+      return res.status(400).json({ error: "Invalid URL format" });
+    }
+
     const jobs = await loadJobs();
-    jobs[id] = { url, schedule };
+    jobs[id] = {
+      url,
+      schedule,
+      cronSecret,
+      createdAt: new Date().toISOString(),
+      createdBy: "JIMEX-X",
+    };
     await saveJobs(jobs);
 
-    startJob(id, url, schedule);
+    startJob(id, url, schedule, cronSecret);
 
-    res.json({ message: "Job added successfully", id });
+    res.json({
+      message: "Job added successfully",
+      job: {
+        id,
+        url,
+        schedule,
+        createdAt: jobs[id].createdAt,
+        createdBy: jobs[id].createdBy,
+      },
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
 // Get all jobs
-app.get("/jobs", async (req, res) => {
+app.get("/jobs", apiKeyMiddleware, async (req, res) => {
   try {
     const jobs = await loadJobs();
-    res.json(jobs);
+    // Remove sensitive data (cronSecret) from response
+    const sanitizedJobs = Object.entries(jobs).reduce((acc, [id, job]) => {
+      const { cronSecret, ...safeJob } = job;
+      acc[id] = safeJob;
+      return acc;
+    }, {});
+    res.json(sanitizedJobs);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
 // Delete a job
-app.delete("/jobs/:id", async (req, res) => {
+app.delete("/jobs/:id", apiKeyMiddleware, async (req, res) => {
   try {
     const { id } = req.params;
     const jobs = await loadJobs();
@@ -139,16 +191,28 @@ app.delete("/jobs/:id", async (req, res) => {
   }
 });
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    activeJobs: activeJobs.size,
+  });
+});
+
 // Self-ping to prevent sleep
 const PING_INTERVAL = 14 * 60 * 1000; // 14 minutes
 function setupSelfPing() {
   const serverUrl = process.env.SERVER_URL || `http://localhost:${PORT}`;
   setInterval(async () => {
     try {
-      await fetch(serverUrl);
-      console.log("Self-ping successful");
+      await fetch(`${serverUrl}/health`);
+      console.log(`[${new Date().toISOString()}] Self-ping successful`);
     } catch (error) {
-      console.error("Self-ping failed:", error.message);
+      console.error(
+        `[${new Date().toISOString()}] Self-ping failed:`,
+        error.message
+      );
     }
   }, PING_INTERVAL);
 }
